@@ -21,13 +21,10 @@ let xrayCore: Target
 if ProcessInfo.processInfo.environment["VLESS_LOCAL_CORE"] == "1" {
   xrayCore = .binaryTarget(name: "XRay", path: "Artifacts/XRay.xcframework")
 } else {
-  // TODO: repoint at this repository's own release once xray-v26.3.27-4 is
-  // tagged here. Until then it consumes the identical artifact published from
-  // vless_dart, so every step of the move stays buildable.
   xrayCore = .binaryTarget(
     name: "XRay",
-    url: "https://github.com/mysteriumnetwork/vless_dart/releases/download/xray-v26.3.27-3/XRay.xcframework.zip",
-    checksum: "9c647f8f4aeadcc32f008a55a8fe4b7ac48e8265718c5849151aff727e9c17ac"
+    url: "https://github.com/mysteriumnetwork/vless-apple/releases/download/xray-v26.3.27-4/XRay.xcframework.zip",
+    checksum: "55db7b12631356abdc4e986c98e63eecac9245e5b61827482e4aa93f14b73c3b"
   )
 }
 
