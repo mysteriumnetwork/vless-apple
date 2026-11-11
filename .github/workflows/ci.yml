@@ -1,0 +1,47 @@
+name: CI
+
+# Swift and Go. Both run without signing now that the tunnel engine is its own
+# package: the suite used to need a signed macOS app because it lived inside a
+# Flutter example carrying a NetworkExtension entitlement.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      # Resolves the published core; no Go toolchain needed.
+      - name: Test
+        run: swift test
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/xray-mobile/go.mod
+          cache-dependency-path: third_party/xray-mobile/go.sum
+
+      - name: Test
+        working-directory: third_party/xray-mobile
+        run: go test ./...
+
+      - name: go.mod is tidy
+        working-directory: third_party/xray-mobile
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum

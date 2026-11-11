@@ -1,0 +1,7 @@
+# The Xray core: ~185 MB, rebuilt on every bump, fetched from a release.
+/Artifacts/
+third_party/xray-mobile/build/
+
+.build/
+.swiftpm/
+.DS_Store

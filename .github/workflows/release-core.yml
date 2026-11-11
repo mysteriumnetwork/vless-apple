@@ -1,0 +1,100 @@
+name: Release Xray core
+
+# Builds XRay.xcframework and publishes it as a release asset.
+#
+# The framework is ~60 MB zipped and is rebuilt on every Xray-core bump, so it
+# is deliberately not committed. Package.swift consumes it as a remote
+# binaryTarget: a consumer cloning this repo downloads a verified archive rather
+# than needing Go, gomobile and a local build.
+#
+# After a run, update the url and checksum in
+# Package.swift — both are printed in the job summary.
+
+on:
+  push:
+    tags: ["xray-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. xray-v26.3.27"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # macOS because `gomobile bind -target=ios` needs the iphoneos and
+    # iphonesimulator SDKs, which only ship with Xcode.
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: third_party/xray-mobile/go.mod
+          cache-dependency-path: third_party/xray-mobile/go.sum
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Initialise gomobile
+        run: gomobile init
+
+      - name: Build the framework
+        run: ./scripts/build_xray_apple.sh
+
+      - name: Package and checksum
+        id: package
+        working-directory: Artifacts
+        run: |
+          zip -qry XRay.xcframework.zip XRay.xcframework
+          checksum="$(swift package compute-checksum XRay.xcframework.zip)"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h XRay.xcframework.zip | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="${GITHUB_REF_NAME}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            Artifacts/XRay.xcframework.zip \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "Trimmed Xray-core built from third_party/xray-mobile.
+
+          SHA-256: \`${{ steps.package.outputs.checksum }}\`" \
+            || gh release upload "${{ steps.tag.outputs.tag }}" \
+                 Artifacts/XRay.xcframework.zip --clobber
+
+      - name: Summary
+        run: |
+          url="https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}/XRay.xcframework.zip"
+          {
+            echo "### Xray core published"
+            echo
+            echo "Size: ${{ steps.package.outputs.size }}"
+            echo
+            echo "Update \`Package.swift\`:"
+            echo
+            echo '```swift'
+            echo '.binaryTarget('
+            echo '  name: "XRay",'
+            echo "  url: \"$url\","
+            echo "  checksum: \"${{ steps.package.outputs.checksum }}\""
+            echo ')'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
