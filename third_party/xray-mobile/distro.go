@@ -8,9 +8,16 @@ package XRay
 // makes it a visible, reviewable change.
 //
 // Deliberately absent: XHTTP, SplitHTTP, HTTPUpgrade, gRPC, QUIC, mKCP,
-// REALITY, VMess, Trojan, Shadowsocks, WireGuard, DNS and routing. Keeping them
-// out holds the binary and the runtime footprint down, which matters because an
-// iOS Network Extension is jetsam-killed past roughly 50 MB.
+// REALITY, VMess, Trojan, Shadowsocks and WireGuard. Keeping them out holds the
+// binary and the runtime footprint down, which matters because an iOS Network
+// Extension is jetsam-killed past roughly 50 MB.
+//
+// DNS and routing are NOT absent, and must not be removed. The emitted config
+// carries a dns block, a dns outbound and a port-53 routing rule; app/dns and
+// proxy/dns reach the binary only because infra/conf pulls them into the
+// closure. Dropping app/router, or narrowing the config loader, produces a core
+// that refuses the production config at core.New — a runtime connect failure,
+// not a compile error. The Go suite boots the real emitted config to catch it.
 //
 // Never fall back to main/distro/all; that defeats the entire design.
 
@@ -25,8 +32,9 @@ import (
 	_ "github.com/xtls/xray-core/app/policy"
 	_ "github.com/xtls/xray-core/app/stats"
 
-	// Routing, so IPv6 can be null-routed inside the tunnel instead of leaking
-	// around it. Free: infra/conf already pulls this into the closure.
+	// Routing, for the port-53 rule that hands DNS to the dns outbound so the
+	// config's IPv4-only queryStrategy applies. Free: infra/conf already pulls
+	// this into the closure.
 	_ "github.com/xtls/xray-core/app/router"
 
 	// Inbound: the loopback SOCKS the tun2socks bridge talks to.

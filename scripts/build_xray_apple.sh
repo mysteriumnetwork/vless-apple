@@ -2,10 +2,8 @@
 #
 # Builds the trimmed Xray core as XRay.xcframework for iOS and macOS.
 #
-# Output goes to darwin/vless_dart/Artifacts/, which Package.swift links only
-# under VLESS_LOCAL_CORE=1; otherwise it fetches a published release. The path must stay inside the SwiftPM package: Flutter symlinks
-# the package into example/ios/Flutter/ephemeral/Packages/, so a binaryTarget
-# path that escapes the package root resolves against that location instead.
+# Output goes to Artifacts/, which Package.swift links only under
+# VLESS_LOCAL_CORE=1; otherwise it fetches a published release.
 #
 # Requires full Xcode (not just Command Line Tools) — `gomobile bind -target=ios`
 # needs the iphoneos and iphonesimulator SDKs.

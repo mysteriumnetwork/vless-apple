@@ -70,6 +70,41 @@ public enum TunnelXrayConfigPreparer {
         )
     }
 
+    /// Rewrites the proxy outbound's `vnext.address` to an IP literal.
+    ///
+    /// The provider excludes the addresses it resolved from the tunnel routes.
+    /// Left dialling the hostname, Xray resolves again on every reconnect, and
+    /// a round-robin or short-TTL record can hand it an address outside that
+    /// set — which the tunnel then captures and routes back into Xray, hanging
+    /// the session in `connected`. TLS `serverName` and the WebSocket `host`
+    /// header are set separately, so both keep carrying the hostname.
+    public static func pinningServerAddress(
+        _ prepared: PreparedTunnelConfig,
+        to literal: String
+    ) throws -> PreparedTunnelConfig {
+        guard var root = try? JSONSerialization.jsonObject(with: prepared.config) as? [String: Any],
+              var outbounds = root["outbounds"] as? [[String: Any]],
+              let index = outbounds.firstIndex(where: { $0["tag"] as? String == "proxy" }),
+              var settings = outbounds[index]["settings"] as? [String: Any],
+              var vnext = settings["vnext"] as? [[String: Any]],
+              !vnext.isEmpty
+        else {
+            throw TunnelConfigError.noProxyOutbound
+        }
+
+        vnext[0]["address"] = literal
+        settings["vnext"] = vnext
+        outbounds[index]["settings"] = settings
+        root["outbounds"] = outbounds
+
+        return PreparedTunnelConfig(
+            config: try JSONSerialization.data(withJSONObject: root),
+            socksPort: prepared.socksPort,
+            credentials: prepared.credentials,
+            serverAddress: prepared.serverAddress
+        )
+    }
+
     /// Binds to port 0 and reads back what the kernel assigned, then closes.
     ///
     /// Racy in principle — another process could claim it in the gap — but the

@@ -82,6 +82,78 @@ final class TunnelXrayConfigPreparerTests: XCTestCase {
         }
     }
 
+    func testPinningReplacesTheOutboundAddressWithTheLiteral() throws {
+        let pinned = try TunnelXrayConfigPreparer.pinningServerAddress(prepared(), to: "203.0.113.7")
+        let vnext = try firstVnext(in: pinned)
+        XCTAssertEqual(vnext["address"] as? String, "203.0.113.7")
+        XCTAssertEqual(vnext["port"] as? Int, 443)
+    }
+
+    /// The whole point of pinning: the literal reaches the dialler while TLS and
+    /// the WebSocket Host header keep the hostname, or the handshake fails.
+    func testPinningLeavesSNIAndHostAlone() throws {
+        let withTLS = """
+        {
+          "inbounds": [{"tag": "socks-in", "protocol": "socks", "listen": "127.0.0.1",
+                        "port": 0, "settings": {"auth": "password", "accounts": []}}],
+          "outbounds": [{
+            "tag": "proxy", "protocol": "vless",
+            "settings": {"vnext": [{"address": "vpn.example.com", "port": 443, "users": []}]},
+            "streamSettings": {
+              "network": "ws", "security": "tls",
+              "tlsSettings": {"serverName": "vpn.example.com", "allowInsecure": false},
+              "wsSettings": {"path": "/vless", "host": "vpn.example.com"}
+            }
+          }]
+        }
+        """
+        let base = try TunnelXrayConfigPreparer.prepare(Data(withTLS.utf8))
+        let pinned = try TunnelXrayConfigPreparer.pinningServerAddress(base, to: "198.51.100.9")
+
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: pinned.config) as? [String: Any])
+        let proxy = try XCTUnwrap((root["outbounds"] as? [[String: Any]])?.first)
+        let stream = try XCTUnwrap(proxy["streamSettings"] as? [String: Any])
+        let tls = try XCTUnwrap(stream["tlsSettings"] as? [String: Any])
+        let ws = try XCTUnwrap(stream["wsSettings"] as? [String: Any])
+
+        XCTAssertEqual(try firstVnext(in: pinned)["address"] as? String, "198.51.100.9")
+        XCTAssertEqual(tls["serverName"] as? String, "vpn.example.com")
+        XCTAssertEqual(ws["host"] as? String, "vpn.example.com")
+    }
+
+    func testPinningCarriesThePortAndCredentialsThrough() throws {
+        let base = try prepared()
+        let pinned = try TunnelXrayConfigPreparer.pinningServerAddress(base, to: "203.0.113.7")
+        XCTAssertEqual(pinned.socksPort, base.socksPort)
+        XCTAssertEqual(pinned.credentials.username, base.credentials.username)
+        XCTAssertEqual(pinned.credentials.password, base.credentials.password)
+        // Still the hostname: the provider logs it and resolves against it.
+        XCTAssertEqual(pinned.serverAddress, base.serverAddress)
+    }
+
+    func testPinningRejectsAConfigWithNoProxyOutbound() throws {
+        let base = try prepared()
+        let stripped = PreparedTunnelConfig(
+            config: Data(#"{"outbounds": [{"tag": "direct"}]}"#.utf8),
+            socksPort: base.socksPort,
+            credentials: base.credentials,
+            serverAddress: base.serverAddress
+        )
+        XCTAssertThrowsError(
+            try TunnelXrayConfigPreparer.pinningServerAddress(stripped, to: "203.0.113.7")
+        ) { XCTAssertEqual($0 as? TunnelConfigError, .noProxyOutbound) }
+    }
+
+    private func firstVnext(in config: PreparedTunnelConfig) throws -> [String: Any] {
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: config.config) as? [String: Any])
+        let outbounds = try XCTUnwrap(root["outbounds"] as? [[String: Any]])
+        let proxy = try XCTUnwrap(outbounds.first { $0["tag"] as? String == "proxy" })
+        let settings = try XCTUnwrap(proxy["settings"] as? [String: Any])
+        return try XCTUnwrap((settings["vnext"] as? [[String: Any]])?.first)
+    }
+
     func testRejectsAConfigWithNoProxyOutbound() {
         let noProxy = """
         {"inbounds": [{"protocol": "socks", "settings": {}}], "outbounds": []}

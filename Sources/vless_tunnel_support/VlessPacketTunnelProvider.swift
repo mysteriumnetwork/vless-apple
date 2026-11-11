@@ -25,8 +25,10 @@ private let log = OSLog(
 
 open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
     private let hev = TunnelWorkerLifecycle()
+    /// Owns the Xray and tun2socks lifecycle. Start, stop and the worker's own
+    /// exit all run here, so a stop arriving mid-startup queues behind it.
     private let runtimeQueue = DispatchQueue(label: "com.mysteriumvpn.vless.runtime")
-    private var hevLogURL: URL?
+    /// True once startup reported success. Only touched on `runtimeQueue`.
     private var started = false
     private var footprintTimer: DispatchSourceTimer?
 
@@ -69,7 +71,29 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         os_log("[TUNNEL] prepared; server=%@ socksPort=%d", log: log, type: .info,
                prepared.serverAddress, prepared.socksPort)
 
-        applyNetworkSettings(serverAddress: prepared.serverAddress) { [weak self] error in
+        let addresses = resolveAll(prepared.serverAddress, family: AF_INET)
+        let addresses6 = resolveAll(prepared.serverAddress, family: AF_INET6)
+        guard let resolved = addresses.first else {
+            os_log("[TUNNEL] cannot resolve %@", log: log, type: .error, prepared.serverAddress)
+            completionHandler(TunnelConfigError.unresolvableServer)
+            return
+        }
+
+        // Dial the literal excluded from the tunnel routes below. Resolving once
+        // here and pinning it means a later re-resolution cannot hand Xray an
+        // address the tunnel captures and routes back into itself.
+        let pinned: PreparedTunnelConfig
+        do {
+            pinned = try TunnelXrayConfigPreparer.pinningServerAddress(prepared, to: resolved)
+        } catch {
+            os_log("[TUNNEL] pinning server address failed: %@", log: log, type: .error, "\(error)")
+            completionHandler(error)
+            return
+        }
+
+        applyNetworkSettings(
+            resolved: resolved, addresses: addresses, addresses6: addresses6
+        ) { [weak self] error in
             guard let self else {
                 os_log("[TUNNEL] provider deallocated during setup", log: log, type: .error)
                 completionHandler(TunnelConfigError.malformedConfig)
@@ -84,7 +108,7 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
             os_log("[TUNNEL] network settings applied", log: log, type: .info)
             self.runtimeQueue.async {
                 do {
-                    try self.startRuntime(prepared)
+                    try self.startRuntime(pinned)
                     self.reasserting = false
                     self.started = true
                     os_log("[TUNNEL] forwarding ready", log: log, type: .info)
@@ -101,8 +125,13 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
 
     override open func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         os_log("[TUNNEL] stopTunnel: %d", log: log, type: .info, reason.rawValue)
-        teardown()
-        completionHandler()
+        // On runtimeQueue so a stop during startup waits for it instead of
+        // racing it. XRayStop() landing before XRayStart() returns leaves Go's
+        // instance set, and every later connect fails with "already running".
+        runtimeQueue.async {
+            self.teardown()
+            completionHandler()
+        }
     }
 
     override open func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
@@ -135,7 +164,9 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
 
         let logURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("hev-socks5-tunnel.log")
-        hevLogURL = logURL
+        // hev appends. Without this a session that trips a recurring error grows
+        // the file without bound, inside a process the system kills on size.
+        try? FileManager.default.removeItem(at: logURL)
 
         let hevConfig = TunnelBridgeConfiguration.yaml(
             socksPort: prepared.socksPort,
@@ -152,15 +183,31 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             let code = Socks5Tunnel.run(withConfig: .string(content: hevConfig))
-            _ = self.hev.markExited(code: code)
+            if self.hev.markExited(code: code) {
+                self.runtimeQueue.async { self.handleUnexpectedWorkerExit(code: code) }
+            }
         }.start()
 
         switch hev.waitForStableStartup(gracePeriod: hevStartupGrace) {
         case .running:
             return
-        default:
-            throw TunnelConfigError.noFreePort
+        case let .exited(code):
+            throw TunnelRuntimeError.workerExited(code: code)
+        case .neverStarted:
+            throw TunnelRuntimeError.workerNeverStarted
         }
+    }
+
+    /// The tun2socks worker returned without being asked to, so the tunnel is up
+    /// and forwarding nothing. Tear it down rather than leave the app showing a
+    /// healthy tunnel that drops every packet.
+    private func handleUnexpectedWorkerExit(code: Int32) {
+        // Inside the startup window `waitForStableStartup` sees the same exit and
+        // startTunnel fails with it; only a mid-session death reaches here.
+        guard started else { return }
+        os_log("[TUNNEL] tun2socks exited unexpectedly: %d", log: log, type: .error, code)
+        teardown()
+        cancelTunnelWithError(TunnelRuntimeError.workerExited(code: code))
     }
 
     private func teardown() {
@@ -202,10 +249,14 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         return info.phys_footprint
     }
 
+    /// Debug only. A 5-second wakeup for a whole session is real cost in a
+    /// process the system kills on footprint, and the app can read the same
+    /// number on demand through `handleAppMessage`.
     private func startFootprintSampling() {
+        #if DEBUG
         footprintTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: runtimeQueue)
-        timer.schedule(deadline: .now(), repeating: 5)
+        timer.schedule(deadline: .now(), repeating: 5, leeway: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard self != nil, let bytes = Self.footprintBytes() else { return }
             let stats = Socks5Tunnel.stats
@@ -214,36 +265,31 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         }
         timer.resume()
         footprintTimer = timer
+        #endif
     }
 
     // MARK: - Network settings
 
-    /// The direct route for [serverAddress] is load-bearing: without it the
+    /// Excluding the server from the tunnel is load-bearing: without it the
     /// tunnel routes its own VLESS transport back into itself and deadlocks.
+    ///
+    /// `resolved` must be an IP literal — a hostname is rejected with
+    /// NETunnelProviderErrorDomain Code=1.
     private func applyNetworkSettings(
-        serverAddress: String,
+        resolved: String,
+        addresses: [String],
+        addresses6: [String],
         completion: @escaping (Error?) -> Void
     ) {
-        // tunnelRemoteAddress must be an IP literal; a hostname is rejected with
-        // NETunnelProviderErrorDomain Code=1.
-        let addresses = resolveAll(serverAddress, family: AF_INET)
-        let addresses6 = resolveAll(serverAddress, family: AF_INET6)
-        guard let resolved = addresses.first else {
-            os_log("[TUNNEL] cannot resolve %@", log: log, type: .error, serverAddress)
-            completion(TunnelConfigError.unresolvableServer)
-            return
-        }
-        os_log("[TUNNEL] applying settings; server=%@ -> %@", log: log, type: .info,
-               serverAddress, resolved)
+        os_log("[TUNNEL] applying settings; remote=%@", log: log, type: .info, resolved)
 
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: resolved)
         settings.mtu = NSNumber(value: tunnelMTU)
 
         let ipv4 = NEIPv4Settings(addresses: [tunnelAddress], subnetMasks: ["255.255.255.0"])
         ipv4.includedRoutes = [NEIPv4Route.default()]
-        // Without these the tunnel routes its own VLESS transport into itself.
-        // Every A record is excluded, not just the one used as the remote
-        // address, because Xray dials by hostname and may pick any of them.
+        // Xray dials the pinned literal, but every A record is excluded anyway
+        // so nothing that retries by hostname can be captured either.
         ipv4.excludedRoutes = addresses.map {
             NEIPv4Route(destinationAddress: $0, subnetMask: "255.255.255.255")
         }
@@ -252,8 +298,10 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         // Capture IPv6 as well. Leaving ipv6Settings nil does not disable the
         // device's physical IPv6 — it routes it outside the tunnel, which on a
         // dual-stack network leaks the user's real address for everything that
-        // prefers IPv6. Captured traffic is dropped by the ::/0 routing rule in
-        // the Xray config, so clients fall back to IPv4.
+        // prefers IPv6. Captured traffic is proxied, not dropped: dropping it
+        // reaches the client as "connected, then closed", which Chrome never
+        // retries over IPv4. Names resolve v4-only via the config's
+        // queryStrategy instead.
         let ipv6 = NEIPv6Settings(addresses: [tunnelAddressIPv6], networkPrefixLengths: [64])
         ipv6.includedRoutes = [NEIPv6Route.default()]
         ipv6.excludedRoutes = addresses6.map {
@@ -261,8 +309,9 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         }
         settings.ipv6Settings = ipv6
 
-        // Public resolvers reached through the tunnel. A virtual DNS server
-        // would need Xray's DNS app, which the trimmed distro leaves out.
+        // Public resolvers, reached through the tunnel. Queries hit Xray's DNS
+        // outbound via the port-53 routing rule, which applies the config's
+        // IPv4-only queryStrategy.
         let dns = NEDNSSettings(servers: ["1.1.1.1", "1.0.0.1"])
         dns.matchDomains = [""]
         settings.dnsSettings = dns

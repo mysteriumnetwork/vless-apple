@@ -1,5 +1,17 @@
 import Foundation
 
+/// A failure of the tun2socks worker itself, as opposed to a bad config.
+///
+/// Kept distinct from `TunnelConfigError.noFreePort`: reporting every startup
+/// failure as a port problem sends the next debugging session at the one
+/// component that was not involved.
+public enum TunnelRuntimeError: Error, Equatable {
+    /// The worker returned. Carries tun2socks' own exit code.
+    case workerExited(code: Int32)
+    /// The worker thread never reached its run loop.
+    case workerNeverStarted
+}
+
 /// Coordinates the tun2socks worker, which runs a blocking call on its own
 /// thread.
 ///
