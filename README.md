@@ -55,12 +55,18 @@ and stops them when hev exits. Forwarding failures set the startup failure flag
 and normally stop a running hev worker. Adapter failures use worker exit code
 `-1000 - errno`.
 
-The pulled lifecycle changes gate the quit call on `hev_ready` and bound the
-readiness polling loop. Initialization failure can still race that flag and
-block teardown inside hev's quit API; the polling limit does not bound the API
-call itself. See the [DNS and lifecycle review](docs/ipv6-dns-lifecycle-review-2026-11-12.md)
-for the isolated reproducer and remaining IPv6-only transport work. These
-changes do not close that initialization-failure gap.
+The runtime uses the pinned archive's separate init, run and cleanup exports.
+Each bridge owns its stop state: a request during initialization is queued;
+a successful init publishes readiness and sends at most one quit event. Quit
+and descriptor cleanup share a mutex, so a failed or finished session cannot
+leave a caller waiting for the next session's event socket. Overlapping hev
+runs are rejected, and the provider rechecks cancellation after C registration.
+
+This depends on private exports of the exact Tun2SocksKit 5.15.0 / hev 2.15.0
+archive. Keep `HevPinnedABI.h` and the lifecycle sequence in sync when changing
+that pin. The simulator archive contains only stubs; its existing fail-fast
+behavior is preserved. See the [DNS and lifecycle review](docs/ipv6-dns-lifecycle-review-2026-11-12.md)
+for the regressions, historical reproducer and remaining IPv6-only underlay gap.
 
 ## Development
 

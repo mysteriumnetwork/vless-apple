@@ -50,9 +50,9 @@ final class TunnelPacketBridgeTests: XCTestCase {
         // The bridge holds a dup; closing both originals strands it on a dead
         // peer, so poll reports POLLHUP and the forwarder takes its error path.
         fds.forEach { Darwin.close($0) }
-        // Let the forwarder observe POLLHUP first; stopping immediately would
-        // take the clean-shutdown branch and never exercise the error path.
-        Thread.sleep(forTimeInterval: 0.2)
+        // Wait for the I/O failure itself. An immediate stop could instead
+        // take the clean-shutdown branch and leave the error path untested.
+        waitForBridgeFailure(bridge)
 
         var result: Int32 = -1
         let stopped = DispatchSemaphore(value: 0)
@@ -63,6 +63,230 @@ final class TunnelPacketBridgeTests: XCTestCase {
         XCTAssertEqual(stopped.wait(timeout: .now() + 5), .success,
                        "stop() blocked — the quit is back on the forwarder thread")
         XCTAssertNotEqual(result, 0, "the forwarder should have recorded the I/O error")
+    }
+
+    func testFailedHevInitializationDoesNotHangOrStopTheNextSession() throws {
+        try isolatedHevTest(#function) {
+            for _ in 0..<32 {
+                let fds = try self.pair()
+                Darwin.close(fds[1])
+                let invalid = "tunnel: [invalid"
+                let result = invalid.withCString {
+                    vless_ipv4_socks5_run_on_descriptor($0, invalid.utf8.count, fds[0])
+                }
+                Darwin.close(fds[0])
+                XCTAssertNotEqual(result, 0)
+                vless_ipv4_socks5_quit() // An idle stop must not reach the next run.
+            }
+            // Fail after parsing too, before hev creates its quit event socket.
+            let fds = try self.pair()
+            let badLog = self.idleHevConfig(logPath: "/nonexistent-vless-test/log")
+            let result = badLog.withCString {
+                vless_ipv4_socks5_run_on_descriptor($0, badLog.utf8.count, fds[0])
+            }
+            fds.forEach { Darwin.close($0) }
+            XCTAssertEqual(result, -2)
+            for _ in 0..<3 {
+                try self.withIdleHev { _ in
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+            }
+        }
+    }
+
+    func testStopDuringHevInitializationIsQueuedWithoutBlocking() throws {
+        try isolatedHevTest(#function) {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory,
+                                                     withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let fifo = directory.appendingPathComponent("hev-log").path
+            XCTAssertEqual(mkfifo(fifo, 0o600), 0)
+            let fds = try self.pair()
+            defer { fds.forEach { Darwin.close($0) } }
+            let observation = HevObservation()
+            let config = self.idleHevConfig(logPath: fifo)
+            self.startObservedHev(config, tunnel: fds[0], observation: observation)
+            XCTAssertEqual(observation.registered.wait(timeout: .now() + 1), .success)
+            // Let init reach the logger; it cannot finish opening its FIFO
+            // until a reader exists, so no quit event can have been published.
+            Thread.sleep(forTimeInterval: 0.05)
+            XCTAssertNil(observation.code)
+            let started = Date()
+            vless_ipv4_socks5_quit()
+            vless_ipv4_socks5_quit()
+            XCTAssertLessThan(Date().timeIntervalSince(started), 0.25)
+            let reader = Darwin.open(fifo, O_RDONLY | O_NONBLOCK)
+            XCTAssertGreaterThanOrEqual(reader, 0)
+            defer { if reader >= 0 { Darwin.close(reader) } }
+            XCTAssertEqual(observation.exited.wait(timeout: .now() + 2), .success)
+            XCTAssertEqual(observation.code, 0)
+            try self.withIdleHev { _ in Thread.sleep(forTimeInterval: 0.05) }
+        }
+    }
+
+    func testCancellationAfterTheProviderCheckSkipsInitialization() throws {
+        try isolatedHevTest(#function) {
+            let fds = try self.pair()
+            defer { fds.forEach { Darwin.close($0) } }
+            // Invalid input proves cancellation is observed before parsing.
+            let invalid = "tunnel: [invalid"
+            let result = invalid.withCString {
+                vless_ipv4_socks5_run_on_descriptor_with_stop_check(
+                    $0, invalid.utf8.count, fds[0], { _ in 1 }, nil)
+            }
+            XCTAssertEqual(result, 0)
+            try self.withIdleHev { _ in Thread.sleep(forTimeInterval: 0.05) }
+        }
+    }
+
+    func testOtherBridgesAndConcurrentStartsCannotStopTheActiveSession() throws {
+        try isolatedHevTest(#function) {
+            try self.withIdleHev { observation in
+                let other = try self.pair()
+                let bridge = try XCTUnwrap(vless_packet_bridge_start(other[0]))
+                XCTAssertEqual(shutdown(other[0], SHUT_RDWR), 0)
+                other.forEach { Darwin.close($0) }
+                self.waitForBridgeFailure(bridge)
+                XCTAssertNotEqual(vless_packet_bridge_stop(bridge), 0)
+                XCTAssertEqual(vless_ipv4_socks5_forwarder_failed(), 0)
+
+                let second = try self.pair()
+                defer { second.forEach { Darwin.close($0) } }
+                let config = self.idleHevConfig()
+                let result = config.withCString {
+                    vless_ipv4_socks5_run_on_descriptor($0, config.utf8.count, second[0])
+                }
+                XCTAssertEqual(result, -1000 - EBUSY)
+                XCTAssertNil(observation.code)
+                // Several simultaneous stops must send at most one event byte.
+                DispatchQueue.concurrentPerform(iterations: 8) { _ in
+                    vless_ipv4_socks5_quit()
+                }
+            }
+            try self.withIdleHev { _ in Thread.sleep(forTimeInterval: 0.05) }
+        }
+    }
+
+    private func waitForBridgeFailure(_ bridge: OpaquePointer) {
+        let deadline = Date().addingTimeInterval(2)
+        while vless_packet_bridge_failed(bridge) == 0 && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.001)
+        }
+        XCTAssertNotEqual(vless_packet_bridge_failed(bridge), 0,
+                          "The injected I/O error must reach the forwarder")
+    }
+
+    private final class HevObservation: @unchecked Sendable {
+        let registered = DispatchSemaphore(value: 0)
+        let exited = DispatchSemaphore(value: 0)
+        private let lock = NSLock()
+        private var result: Int32?
+        var code: Int32? {
+            lock.lock()
+            defer { lock.unlock() }
+            return result
+        }
+        func finish(_ code: Int32) {
+            lock.lock()
+            result = code
+            lock.unlock()
+            exited.signal()
+        }
+    }
+
+    private func idleHevConfig(logPath: String = "stderr") -> String {
+        """
+        tunnel:
+          mtu: 1500
+        socks5:
+          address: 127.0.0.1
+          port: 9
+          pipeline: false
+        misc:
+          log-level: error
+          log-file: '\(logPath.replacingOccurrences(of: "'", with: "''"))'
+        """
+    }
+
+    private func startObservedHev(_ config: String, tunnel: Int32,
+                                  observation: HevObservation) {
+        DispatchQueue.global().async {
+            let code = config.withCString {
+                vless_ipv4_socks5_run_on_descriptor_with_stop_check(
+                    $0, config.utf8.count, tunnel, { context in
+                        guard let context else { return 0 }
+                        Unmanaged<HevObservation>.fromOpaque(context)
+                            .takeUnretainedValue().registered.signal()
+                        return 0
+                    }, Unmanaged.passUnretained(observation).toOpaque())
+            }
+            observation.finish(code)
+        }
+    }
+
+    private func withIdleHev(_ body: (HevObservation) throws -> Void) throws {
+        let fds = try pair()
+        defer { fds.forEach { Darwin.close($0) } }
+        let observation = HevObservation()
+        startObservedHev(idleHevConfig(), tunnel: fds[0], observation: observation)
+        XCTAssertEqual(observation.registered.wait(timeout: .now() + 1), .success)
+        Thread.sleep(forTimeInterval: 0.02)
+        XCTAssertNil(observation.code, "A stale stop must not kill the new session")
+        defer {
+            vless_ipv4_socks5_quit()
+            XCTAssertEqual(observation.exited.wait(timeout: .now() + 2), .success)
+            XCTAssertEqual(observation.code, 0)
+        }
+        try body(observation)
+    }
+
+    /// Real hev keeps process globals. Isolate initialization/reconnect probes
+    /// from the payload test and kill a regressing child rather than hang CI.
+    private func isolatedHevTest(_ function: String, body: () throws -> Void) throws {
+        #if os(macOS)
+        let method = String(function.prefix { $0 != "(" })
+        let key = "VLESS_ISOLATED_HEV_TEST"
+        if ProcessInfo.processInfo.environment[key] == method {
+            try body()
+            return
+        }
+        let process = Process()
+        let runner = URL(fileURLWithPath: CommandLine.arguments[0])
+        guard runner.lastPathComponent == "xctest" else {
+            throw XCTSkip("Run isolated lifecycle probes with swift test on macOS")
+        }
+        // Launch xctest directly so the timeout kills the actual test process,
+        // never a tool wrapper that could leave its child and pipe alive.
+        process.executableURL = runner
+        process.arguments = ["-XCTest", NSStringFromClass(type(of: self)) + "/" + method,
+                             Bundle(for: type(of: self)).bundleURL.path]
+        // XCTest prints its environment on launch errors; pass only toolchain
+        // settings rather than inheriting developer credentials into a child.
+        let allowed = Set(["PATH", "TMPDIR", "DYLD_FRAMEWORK_PATH", "DYLD_LIBRARY_PATH",
+                           "DEVELOPER_DIR", "SDKROOT", "LANG", "LC_ALL"])
+        var environment = ProcessInfo.processInfo.environment.filter { allowed.contains($0.key) }
+        environment[key] = method
+        process.environment = environment
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        let done = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in done.signal() }
+        try process.run()
+        let timedOut = done.wait(timeout: .now() + 8) != .success
+        if timedOut {
+            Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+        let diagnostic = String(data: output.fileHandleForReading.readDataToEndOfFile(),
+                                encoding: .utf8) ?? ""
+        XCTAssertFalse(timedOut, "Isolated hev lifecycle test hung: \(diagnostic)")
+        XCTAssertEqual(process.terminationStatus, 0, diagnostic)
+        #else
+        throw XCTSkip("Real-hev lifecycle fault injection runs in bounded macOS subprocesses")
+        #endif
     }
 
     func testPreservesIPv4DatagramsInBothDirections() throws {

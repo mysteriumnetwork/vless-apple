@@ -183,7 +183,12 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             let code = hevConfig.withCString {
-                vless_ipv4_socks5_run($0, hevConfig.utf8.count)
+                vless_ipv4_socks5_run_with_stop_check($0, hevConfig.utf8.count, { context in
+                    guard let context else { return 0 }
+                    let lifecycle = Unmanaged<TunnelWorkerLifecycle>.fromOpaque(context)
+                        .takeUnretainedValue()
+                    return lifecycle.isStopRequested ? 1 : 0
+                }, Unmanaged.passUnretained(self.hev).toOpaque())
             }
             if self.hev.markExited(code: code) {
                 self.runtimeQueue.async { self.handleUnexpectedWorkerExit(code: code) }

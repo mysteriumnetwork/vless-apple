@@ -1,4 +1,5 @@
 #include "VlessPacketBridge.h"
+#include "VlessHevRuntime.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -32,19 +33,15 @@ struct vless_sockaddr_ctl {
 _Static_assert(sizeof(struct vless_ctl_info) == 100, "Darwin ctl_info ABI");
 _Static_assert(sizeof(struct vless_sockaddr_ctl) == 32, "Darwin sockaddr_ctl ABI");
 
-// Exported by the pinned HevSocks5Tunnel archive linked by Tun2SocksKit.
-extern int hev_socks5_tunnel_main_from_str(const unsigned char *, unsigned int, int);
-extern void hev_socks5_tunnel_quit(void);
-
-// hev_socks5_tunnel_quit() blocks forever until some hev exists, and then
-// quits whichever one does. Both are hazards: quitting before hev starts hangs
-// the caller, and a call left blocked kills the NEXT hev in the process. So
-// quit only while our own hev is known to be running. One tunnel per process,
-// hence one flag.
-static atomic_bool hev_ready;
+// hev has process-wide globals: reject overlapping runs, and protect the active
+// bridge's lifetime while a provider asks it to stop. The forwarding thread uses
+// its own runtime, so an old/standalone bridge can never stop another session.
+static pthread_mutex_t run_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t active_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct vless_packet_bridge *active_bridge;
 // Set when the forwarder dies. hev can be healthy while the bridge is not,
 // which would report a started tunnel that carries nothing, so startup
-// checks this. Session-scoped: cleared when a bridge starts.
+// checks this. Session-scoped: cleared when a managed run registers.
 static atomic_bool forwarder_failed;
 
 // utun datagrams carry a four-byte, network-order address-family prefix.
@@ -62,6 +59,8 @@ struct vless_packet_bridge {
     int wake[2];
     pthread_t thread;
     atomic_bool stopping;
+    atomic_bool failed;
+    struct vless_hev_runtime runtime;
     atomic_uint_fast64_t dropped_ipv6;
     int error; // Written by the worker, read only after pthread_join.
     struct packet to_hev;
@@ -82,6 +81,7 @@ static void close_bridge(struct vless_packet_bridge *bridge)
     for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); ++i)
         if (fds[i] >= 0)
             close(fds[i]);
+    vless_hev_runtime_destroy(&bridge->runtime);
     free(bridge);
 }
 
@@ -177,34 +177,14 @@ static void *forward_packets(void *context)
     if (atomic_load(&bridge->stopping))
         return NULL;
     bridge->error = errno ? errno : EIO;
-    atomic_store(&forwarder_failed, true);
-    // An I/O failure must tear down hev too. Retry the wakeup: the first
-    // failure can race hev initializing its quit event fd. Bounded at ~5s so a
-    // hev that honours quit late cannot pin this thread at 100 Hz forever.
-    //
-    // KNOWN GAP, needs a design decision rather than a patch here.
-    // hev_socks5_tunnel_quit() blocks forever when hev has not started
-    // (measured), so a forwarder that fails before hev initializes never
-    // returns from the first call: the thread leaks and stop()'s pthread_join
-    // hangs teardown. Two fixes were tried and are worse:
-    //   - closing hev's descriptor does not stop it (measured: alive >5s);
-    //   - quitting on a detached thread unblocks later and kills the NEXT
-    //     hev in the process, so a failed session breaks the next connect
-    //     (measured: it killed the real-hev test that ran after it).
-    // The workable shape is to gate this on hev readiness, which the Swift
-    // lifecycle already tracks, rather than guessing from inside the bridge.
-    // Only once hev is up, and only while it is: quitting earlier never
-    // returns, and the retry window lets a hev that is still starting become
-    // ready. If it never does, give up rather than pin the thread — stop()
-    // joins it, and the Swift teardown quits hev when it is safe to.
-    for (int attempt = 0; attempt < 500 && !atomic_load(&bridge->stopping); ++attempt) {
-        if (atomic_load(&hev_ready)) {
-            hev_socks5_tunnel_quit();
-            break;
-        }
-        struct pollfd wake = { .fd = bridge->wake[0], .events = POLLIN };
-        poll(&wake, 1, 10);
-    }
+    atomic_store(&bridge->failed, true);
+    pthread_mutex_lock(&active_lock);
+    if (active_bridge == bridge)
+        atomic_store(&forwarder_failed, true);
+    pthread_mutex_unlock(&active_lock);
+    // Queue during init, notify once after init, or do nothing after cleanup.
+    // This never waits for an event socket belonging to a future session.
+    vless_hev_runtime_request_stop(&bridge->runtime);
     return NULL;
 }
 
@@ -213,12 +193,17 @@ struct vless_packet_bridge *vless_packet_bridge_start(int tunnel_fd)
     struct vless_packet_bridge *bridge = calloc(1, sizeof(*bridge));
     if (!bridge)
         return NULL;
+    int runtime_error = vless_hev_runtime_init(&bridge->runtime);
+    if (runtime_error) {
+        free(bridge);
+        errno = runtime_error;
+        return NULL;
+    }
     bridge->tunnel = -1;
     bridge->sockets[0] = bridge->sockets[1] = -1;
     bridge->wake[0] = bridge->wake[1] = -1;
     atomic_init(&bridge->stopping, false);
-    atomic_store(&hev_ready, false);
-    atomic_store(&forwarder_failed, false);
+    atomic_init(&bridge->failed, false);
     atomic_init(&bridge->dropped_ipv6, 0);
     // Borrow the provider's utun for the session; never close its original fd.
     // dup shares file-status flags: prepare_fd sets O_NONBLOCK on the original
@@ -268,6 +253,11 @@ uint64_t vless_packet_bridge_dropped_ipv6(const struct vless_packet_bridge *brid
     return atomic_load(&bridge->dropped_ipv6);
 }
 
+int vless_packet_bridge_failed(const struct vless_packet_bridge *bridge)
+{
+    return atomic_load(&bridge->failed) ? 1 : 0;
+}
+
 int vless_packet_bridge_stop(struct vless_packet_bridge *bridge)
 {
     atomic_store(&bridge->stopping, true);
@@ -303,29 +293,59 @@ static int find_utun(void)
 
 int vless_ipv4_socks5_run(const char *config, size_t config_length)
 {
+    return vless_ipv4_socks5_run_with_stop_check(config, config_length, NULL, NULL);
+}
+
+int vless_ipv4_socks5_run_with_stop_check(const char *config, size_t config_length,
+                                        vless_socks5_stop_check stop_check, void *context)
+{
     int tunnel = find_utun();
     if (tunnel < 0)
         return -1000 - errno;
-    return vless_ipv4_socks5_run_on_descriptor(config, config_length, tunnel);
+    return vless_ipv4_socks5_run_on_descriptor_with_stop_check(
+        config, config_length, tunnel, stop_check, context);
 }
 
 int vless_ipv4_socks5_run_on_descriptor(const char *config, size_t config_length, int tunnel_fd)
 {
+    return vless_ipv4_socks5_run_on_descriptor_with_stop_check(
+        config, config_length, tunnel_fd, NULL, NULL);
+}
+
+int vless_ipv4_socks5_run_on_descriptor_with_stop_check(
+    const char *config, size_t config_length, int tunnel_fd,
+    vless_socks5_stop_check stop_check, void *context)
+{
     if (config_length > UINT_MAX)
         return -1000 - EINVAL;
+    int lock_error = pthread_mutex_trylock(&run_lock);
+    if (lock_error)
+        return -1000 - lock_error;
     struct vless_packet_bridge *bridge = vless_packet_bridge_start(tunnel_fd);
-    if (!bridge)
-        return -1000 - errno;
-    // Ready from here: hev main is being entered, so a quit can only block for
-    // as long as its initialization takes, never forever. Set before the call
-    // because it does not return until hev stops.
-    atomic_store(&hev_ready, true);
-    int result = hev_socks5_tunnel_main_from_str((const unsigned char *)config,
-                                               (unsigned int)config_length,
-                                               vless_packet_bridge_descriptor(bridge));
-    // hev has returned; a later quit would land on whatever starts next.
-    atomic_store(&hev_ready, false);
+    if (!bridge) {
+        int error = errno;
+        pthread_mutex_unlock(&run_lock);
+        return -1000 - error;
+    }
+    pthread_mutex_lock(&active_lock);
+    active_bridge = bridge;
+    atomic_store(&forwarder_failed, atomic_load(&bridge->failed));
+    pthread_mutex_unlock(&active_lock);
+    // Registration precedes this check: a stop racing the provider's earlier
+    // Swift check is either observed here or delivered to this active runtime.
+    // Call outside our locks so the caller may safely inspect its own lifecycle.
+    if (stop_check && stop_check(context))
+        vless_hev_runtime_request_stop(&bridge->runtime);
+    int result = vless_hev_runtime_run(&bridge->runtime,
+        (const unsigned char *)config, (unsigned int)config_length,
+        vless_packet_bridge_descriptor(bridge));
+    pthread_mutex_lock(&active_lock);
+    active_bridge = NULL;
+    pthread_mutex_unlock(&active_lock);
     int error = vless_packet_bridge_stop(bridge);
+    if (error)
+        atomic_store(&forwarder_failed, true);
+    pthread_mutex_unlock(&run_lock);
     return error ? -1000 - error : result;
 }
 
@@ -336,8 +356,8 @@ int vless_ipv4_socks5_forwarder_failed(void)
 
 void vless_ipv4_socks5_quit(void)
 {
-    // Same rule as the bridge's error path: before hev is up this never
-    // returns, and teardown would hang behind it.
-    if (atomic_load(&hev_ready))
-        hev_socks5_tunnel_quit();
+    pthread_mutex_lock(&active_lock);
+    if (active_bridge)
+        vless_hev_runtime_request_stop(&active_bridge->runtime);
+    pthread_mutex_unlock(&active_lock);
 }

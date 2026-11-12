@@ -14,9 +14,13 @@ above; the build configuration used is third_party/xray-mobile/distro.go.
 --------------------------------------------------------------------------------
 hev-socks5-tunnel — MIT License
 Copyright (c) 2019 hev
+Copyright (c) 2022 hev
+Copyright (c) 2019-2023 hev (adapted lifecycle sequence)
 https://github.com/heiher/hev-socks5-tunnel
 
-Distributed in binary form via Tun2SocksKit.
+Distributed in binary form via Tun2SocksKit. The initialization and cleanup
+sequence in Sources/VlessPacketBridge/VlessHevRuntime.c is adapted from hev
+2.15.0 src/hev-main.c; it uses the pinned archive's existing exported functions.
 
 --------------------------------------------------------------------------------
 Tun2SocksKit — MIT License

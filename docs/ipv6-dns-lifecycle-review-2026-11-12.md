@@ -5,13 +5,39 @@ with IPv4 pin validation, zero-length datagram handling, bounded socket buffers
 and the full TCP payload regression. The measurements in the [iPhone profile
 notes](device-profile-2026-11-12.md) predate those two lifecycle commits.
 
-The initialization-failure finding below remains open. The passing native tests
-and iOS build do not establish that this failure path is safe, or that a pure
-DNS64/NAT64 network is supported.
+The initialization-failure hang described below is fixed by the phased runtime.
+Pure DNS64/NAT64 underlay support remains unvalidated; this lifecycle fix does
+not change the IPv4 pinning or packet policy.
 
-## Blocking finding in the pulled commit
+## Initialization-failure teardown: resolved
 
-`hev_ready` is set immediately before `hev_socks5_tunnel_main_from_str`, not after
+`VlessHevRuntime.c` now calls the pinned archive's separate initialization,
+run and cleanup exports instead of its monolithic `main_from_str`. It marks
+readiness only after `hev_socks5_tunnel_init` succeeds. A bridge owns its own
+stop request and one-shot quit state; a stop during initialization is queued
+rather than waiting for an event descriptor that might never exist.
+
+The runtime mutex serializes quit with descriptor destruction. Cleanup clears
+readiness under that mutex before closing the event socket. The active bridge
+is protected while the provider requests stop, and process-wide initialization
+is exclusive: a second run returns `-1000 - EBUSY` without touching the first.
+A standalone bridge's failure cannot stop the managed session. There are no
+quit retry workers or detached callers that can wake up in a later session.
+
+The provider also passes a cancellation check at C entry. Registration happens
+before that check: a stop racing the earlier Swift check is either seen there
+or queued against the registered runtime. The callback is synchronous and its
+context remains retained by the provider's worker closure until run returns.
+
+This avoids a new binary, but depends on 27 private exports from the exact
+Tun2SocksKit 5.15.0 / hev 2.15.0 archive. `HevPinnedABI.h` lists the signatures;
+the init/unwind sequence follows pinned `src/hev-main.c`. Changing that pin
+requires revalidating the ABI and lifecycle. The simulator archive has only
+nonfunctional public stubs, so its original failure behavior is retained.
+
+### Historical failure and reproducer
+
+In `62ef24d`, `hev_ready` is set immediately before `hev_socks5_tunnel_main_from_str`, not after
 hev's quit event descriptor has been initialized. If initialization fails while
 the forwarder sees an I/O error, the forwarder can enter the blocking quit call
 while the flag is true. Clearing the flag after main returns cannot release that
@@ -25,8 +51,9 @@ Confirmed on the unmodified `62ef24d` C source, linked to the pinned hev archive
   isolated subprocess's two-second timeout. The merged working tree reproduced
   the same hang. Reproducer subprocesses were terminated after the timeout.
 
-An actual initialization-ready signal and a safe stop API are needed; entering
-main is insufficient. This remains an open finding, not an implemented fix.
+The fix uses successful tunnel initialization as the readiness signal and
+serializes stop against cleanup. The same failure cases now return promptly;
+they no longer enter the pinned stop API while its event descriptor is absent.
 
 A minimal reproducer is below. Link it with `VlessPacketBridge.c` and the pinned
 macOS hev archive from Tun2SocksKit 5.15.0. Run each case in a separate subprocess
@@ -54,10 +81,12 @@ int main(int argc, char **argv) {
 }
 ```
 
-The original two-second timeout proves the call fails to return promptly. The
-pinned quit implementation waits until its event descriptor exists, so failed
-initialization leaves that wait without a completion condition. The existing
-teardown test where hev was never entered does not exercise this race.
+On the old implementation, the two-second timeout demonstrated failure to
+return promptly. The pinned quit implementation waits until its event
+descriptor exists, so failed initialization leaves that wait without a
+completion condition. Against the fixed runtime, the reproducer returns an
+initialization or forwarding error. The new subprocess regressions cover this
+race, not just the earlier no-start case.
 
 ## DNS verification against the published Xray library
 
@@ -116,9 +145,19 @@ Primary references:
 
 ## Validation
 
-The updated branch plus the local fixes passes 39 native tests and an unsigned
-arm64 iOS build. The earlier signed iPhone build and performance results are
-recorded separately in the profile notes. The new unstarted-hev teardown test covers the no-start case, not failed initialization.
-The initialization-failure repro above is run in a separate bounded subprocess
-so a hang cannot wedge the suite. No further phone session was started; the
-previous iPhone measurements predate these two incoming lifecycle commits.
+- All 43 native tests pass, including the full 512 KiB transfer and IPv6 filter.
+- Four real-hev lifecycle regressions run in separate macOS XCTest subprocesses
+  with an eight-second parent timeout. A regression is killed and reported as a
+  failure rather than wedging CI or contaminating later tests with lwIP globals.
+- Failed initialization is repeated 32 times with a failed forwarding socket,
+  followed by logger-init failure and three successful start/stop sessions.
+- A FIFO blocks initialization before its event socket exists. Stop requests
+  must return promptly, then complete once init is allowed to finish.
+- Late cancellation skips parsing; overlapping runs and an unrelated bridge's
+  failure leave the active session healthy. Duplicate concurrent stops are safe.
+- Required private symbols are present in iOS arm64 and both Mac architectures.
+  Device, simulator and Intel Mac C link probes pass against the unchanged
+  archive. Native iOS and simulator package builds succeed.
+- C warnings-as-errors and static analysis pass. The earlier signed iPhone
+  performance runs predate this fix and were not repeated; data-plane filtering
+  and buffer limits are unchanged.
