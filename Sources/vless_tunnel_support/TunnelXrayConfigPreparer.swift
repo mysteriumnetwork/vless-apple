@@ -23,7 +23,7 @@ public enum TunnelConfigError: Error, Equatable {
     case noProxyOutbound
     case noFreePort
     case unresolvableServer
-    case ipv4ServerAddressRequired
+    case ipLiteralServerAddressRequired
 }
 
 /// Fills in the placeholders the Dart layer leaves behind.
@@ -71,7 +71,7 @@ public enum TunnelXrayConfigPreparer {
         )
     }
 
-    /// Rewrites the proxy outbound's `vnext.address` to an IPv4 literal.
+    /// Rewrites the proxy outbound's `vnext.address` to an IP literal.
     ///
     /// The provider excludes the addresses it resolved from the tunnel routes.
     /// Left dialling the hostname, Xray resolves again on every reconnect, and
@@ -80,18 +80,17 @@ public enum TunnelXrayConfigPreparer {
     /// the session in `connected`. TLS `serverName` and the WebSocket `host`
     /// header are set separately, so both keep carrying the hostname.
     ///
-    /// IPv4 is required by VlessPacketTunnelProvider.applyNetworkSettings:
-    /// it installs no IPv6 excludedRoutes, and VlessPacketBridge drops IPv6
-    /// before hev sees it. Reverting pinning to a hostname or IPv6 literal
-    /// would capture and silently drop the VLESS transport itself. Keep these
-    /// routing and address-family invariants together when adding IPv6 egress.
+    /// Must stay a literal, and the provider must exclude it in its own family:
+    /// `applyNetworkSettings` captures both families, so an address it has not
+    /// excluded reaches VlessPacketBridge, which drops IPv6 outright. IPv6 is
+    /// accepted for NAT64 underlays, where the network offers no IPv4 at all;
+    /// the provider still prefers IPv4 whenever the network has it.
     public static func pinningServerAddress(
         _ prepared: PreparedTunnelConfig,
         to literal: String
     ) throws -> PreparedTunnelConfig {
-        var address = in_addr()
-        guard inet_pton(AF_INET, literal, &address) == 1 else {
-            throw TunnelConfigError.ipv4ServerAddressRequired
+        guard IPLiteral.isPinnable(literal) else {
+            throw TunnelConfigError.ipLiteralServerAddressRequired
         }
         guard var root = try? JSONSerialization.jsonObject(with: prepared.config) as? [String: Any],
               var outbounds = root["outbounds"] as? [[String: Any]],
@@ -150,5 +149,36 @@ public enum TunnelXrayConfigPreparer {
         let port = Int(UInt16(bigEndian: assigned.sin_port))
         guard port > 0 else { throw TunnelConfigError.noFreePort }
         return port
+    }
+}
+
+/// The config preparer and the provider's routing must agree on the family of
+/// the pinned transport literal, or the transport is excluded in one family and
+/// captured in the other.
+enum IPLiteral {
+
+    static func isIPv4(_ text: String) -> Bool {
+        var address = in_addr()
+        return inet_pton(AF_INET, text, &address) == 1
+    }
+
+    /// A literal the provider can also install as an excluded route. Hostnames
+    /// re-resolve; an IPv4-mapped or IPv4-compatible IPv6 literal would be
+    /// dialled as IPv4 while its excluded route went in as IPv6.
+    static func isPinnable(_ text: String) -> Bool {
+        if isIPv4(text) { return true }
+        var address = in6_addr()
+        guard inet_pton(AF_INET6, text, &address) == 1 else { return false }
+        return !embedsIPv4(address)
+    }
+
+    private static func embedsIPv4(_ address: in6_addr) -> Bool {
+        var value = address
+        return withUnsafeBytes(of: &value) { raw in
+            guard raw[0..<10].allSatisfy({ $0 == 0 }) else { return false }
+            let mapped = raw[10] == 0xff && raw[11] == 0xff
+            let compatible = raw[10] == 0 && raw[11] == 0
+            return mapped || compatible
+        }
     }
 }

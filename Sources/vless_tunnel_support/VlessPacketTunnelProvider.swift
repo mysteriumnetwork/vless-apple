@@ -72,8 +72,11 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         os_log("[TUNNEL] prepared; server=%@ socksPort=%d", log: log, type: .info,
                prepared.serverAddress, prepared.socksPort)
 
-        let addresses = resolveAll(prepared.serverAddress, family: AF_INET)
-        guard let resolved = addresses.first else {
+        let addresses = resolveAll(prepared.serverAddress, family: AF_UNSPEC)
+        // Prefer IPv4 whenever the network offers it, so the transport behaves
+        // exactly as before. Only an IPv6-only (NAT64) network falls through to
+        // the synthesized address, which is excluded as an IPv6 route below.
+        guard let resolved = addresses.first(where: IPLiteral.isIPv4) ?? addresses.first else {
             os_log("[TUNNEL] cannot resolve %@", log: log, type: .error, prepared.serverAddress)
             completionHandler(TunnelConfigError.unresolvableServer)
             return
@@ -302,7 +305,7 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.includedRoutes = [NEIPv4Route.default()]
         // Xray dials the pinned literal, but every A record is excluded anyway
         // so nothing that retries by hostname can be captured either.
-        ipv4.excludedRoutes = addresses.map {
+        ipv4.excludedRoutes = addresses.filter(IPLiteral.isIPv4).map {
             NEIPv4Route(destinationAddress: $0, subnetMask: "255.255.255.255")
         }
         settings.ipv4Settings = ipv4
@@ -315,9 +318,16 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         // can race IPv4 normally; an Xray blackhole acts after that handshake.
         let ipv6 = NEIPv6Settings(addresses: [tunnelAddressIPv6], networkPrefixLengths: [64])
         ipv6.includedRoutes = [NEIPv6Route.default()]
-        // No IPv6 bypass: TunnelXrayConfigPreparer.pinningServerAddress above
-        // enforces an IPv4 literal. Keep that guard if changing resolution;
-        // a hostname/IPv6 transport would otherwise hit the IPv6 packet filter.
+        // Bypass IPv6 only when the transport itself is IPv6, which happens on
+        // an IPv6-only (NAT64) network: an unexcluded transport is captured
+        // here and then discarded by the bridge, hanging the session. Where
+        // IPv4 is available the transport uses it, so the server's AAAA records
+        // stay captured; excluding them would widen the bypass for no gain.
+        ipv6.excludedRoutes = IPLiteral.isIPv4(resolved)
+            ? []
+            : addresses.filter { !IPLiteral.isIPv4($0) }.map {
+                NEIPv6Route(destinationAddress: $0, networkPrefixLength: 128)
+            }
         settings.ipv6Settings = ipv6
 
         // Public resolvers, reached through the tunnel. Queries hit Xray's DNS
@@ -331,9 +341,12 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// Every address the host resolves to in [family], so all of them can be
-    /// excluded from the tunnel.
+    /// excluded from the tunnel. `AI_ADDRCONFIG` reports only families the
+    /// device actually has, so an IPv6-only network yields the resolver's
+    /// synthesized NAT64 address instead of an A record it cannot reach.
     private func resolveAll(_ host: String, family: Int32) -> [String] {
-        var hints = addrinfo(ai_flags: 0, ai_family: family, ai_socktype: SOCK_STREAM,
+        var hints = addrinfo(ai_flags: AI_ADDRCONFIG, ai_family: family,
+                             ai_socktype: SOCK_STREAM,
                              ai_protocol: 0, ai_addrlen: 0, ai_canonname: nil,
                              ai_addr: nil, ai_next: nil)
         var info: UnsafeMutablePointer<addrinfo>?
@@ -343,34 +356,40 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         var out: [String] = []
         var node = info
         while let current = node {
-            if let addr = current.pointee.ai_addr {
-                var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-                let printed: Bool
-                if family == AF_INET6 {
-                    var sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
-                        $0.pointee
-                    }
-                    printed = inet_ntop(
-                        AF_INET6, &sin6.sin6_addr, &buffer, socklen_t(INET6_ADDRSTRLEN)
-                    ) != nil
-                } else {
-                    var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
-                        $0.pointee
-                    }
-                    printed = inet_ntop(
-                        AF_INET, &sin.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN)
-                    ) != nil
-                }
-                if printed {
-                    let text = String(cString: buffer)
-                    if !out.contains(text) {
-                        out.append(text)
-                    }
-                }
+            if let addr = current.pointee.ai_addr,
+               let text = Self.printed(addr, family: current.pointee.ai_family),
+               !out.contains(text) {
+                out.append(text)
             }
             node = current.pointee.ai_next
         }
         return out
+    }
+
+    /// Renders one resolved address, by the family the resolver reported for
+    /// it rather than the family that was asked for.
+    private static func printed(_ addr: UnsafeMutablePointer<sockaddr>,
+                                family: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+        switch family {
+        case AF_INET6:
+            var sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+                $0.pointee
+            }
+            guard inet_ntop(
+                AF_INET6, &sin6.sin6_addr, &buffer, socklen_t(INET6_ADDRSTRLEN)
+            ) != nil else { return nil }
+        case AF_INET:
+            var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                $0.pointee
+            }
+            guard inet_ntop(
+                AF_INET, &sin.sin_addr, &buffer, socklen_t(INET_ADDRSTRLEN)
+            ) != nil else { return nil }
+        default:
+            return nil
+        }
+        return String(cString: buffer)
     }
 
 }

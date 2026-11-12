@@ -43,10 +43,19 @@ literal IPv6 destinations. Removing the DNS fix would make dual-stack requests
 pay the application's Happy Eyeballs connection-attempt delay unnecessarily.
 
 The transport bypass depends on `TunnelXrayConfigPreparer.pinningServerAddress`
-accepting only an IPv4 literal. There are no IPv6 excluded routes: a hostname
-or IPv6 VLESS server address would be captured and discarded by the bridge.
-Changes to pinning, excluded routes and IPv6 filtering must preserve this
-invariant together; invalid pinned addresses fail startup explicitly.
+accepting only an IP literal, and on the provider excluding that address in its
+own family. A hostname re-resolves and a family that is captured but not
+excluded is discarded by the bridge, so pinning, excluded routes and IPv6
+filtering must change together; invalid pinned addresses fail startup
+explicitly.
+
+The provider resolves with `AF_UNSPEC` and `AI_ADDRCONFIG` and prefers IPv4
+whenever the network has it, so ordinary networks behave as described above.
+An IPv6-only (NAT64/DNS64) network reports no IPv4, and the resolver returns a
+synthesized IPv6 address for the server; that address is pinned and installed
+as an IPv6 excluded route, so the transport leaves the device while everything
+inside the tunnel keeps the IPv4-only policy. This path has not yet been
+validated on a real NAT64 network.
 
 The adapter lives in `Sources/VlessPacketBridge`. It uses the existing pinned
 hev binary and Darwin utun framing; no fork or new binary artifact is required.
