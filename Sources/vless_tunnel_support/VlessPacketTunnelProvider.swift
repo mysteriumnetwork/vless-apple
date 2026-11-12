@@ -310,11 +310,9 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         // can race IPv4 normally; an Xray blackhole acts after that handshake.
         let ipv6 = NEIPv6Settings(addresses: [tunnelAddressIPv6], networkPrefixLengths: [64])
         ipv6.includedRoutes = [NEIPv6Route.default()]
-        // No IPv6 bypass route for the server. That is safe ONLY because
-        // `TunnelXrayConfigPreparer.pinningServerAddress` rewrites the outbound
-        // to the IPv4 literal resolved above, so the transport never dials IPv6.
-        // Remove the pinning and the bridge silently drops the transport's own
-        // packets: it fails closed rather than leaking, but it fails.
+        // No IPv6 bypass: TunnelXrayConfigPreparer.pinningServerAddress above
+        // enforces an IPv4 literal. Keep that guard if changing resolution;
+        // a hostname/IPv6 transport would otherwise hit the IPv6 packet filter.
         settings.ipv6Settings = ipv6
 
         // Public resolvers, reached through the tunnel. Queries hit Xray's DNS

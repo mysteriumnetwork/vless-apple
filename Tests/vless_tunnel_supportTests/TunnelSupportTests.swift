@@ -89,6 +89,16 @@ final class TunnelXrayConfigPreparerTests: XCTestCase {
         XCTAssertEqual(vnext["port"] as? Int, 443)
     }
 
+    func testPinningRejectsAddressesThatCannotUseTheIPv4TransportBypass() throws {
+        let base = try prepared()
+        for address in ["vpn.example.com", "2001:db8::1", "::ffff:203.0.113.7",
+                        "203.0.113.999", "203.0.113.7:443", ""] {
+            XCTAssertThrowsError(try TunnelXrayConfigPreparer.pinningServerAddress(base, to: address)) {
+                XCTAssertEqual($0 as? TunnelConfigError, .ipv4ServerAddressRequired)
+            }
+        }
+    }
+
     /// The whole point of pinning: the literal reaches the dialler while TLS and
     /// the WebSocket Host header keep the hostname, or the handshake fails.
     func testPinningLeavesSNIAndHostAlone() throws {

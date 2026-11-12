@@ -23,6 +23,7 @@ public enum TunnelConfigError: Error, Equatable {
     case noProxyOutbound
     case noFreePort
     case unresolvableServer
+    case ipv4ServerAddressRequired
 }
 
 /// Fills in the placeholders the Dart layer leaves behind.
@@ -70,7 +71,7 @@ public enum TunnelXrayConfigPreparer {
         )
     }
 
-    /// Rewrites the proxy outbound's `vnext.address` to an IP literal.
+    /// Rewrites the proxy outbound's `vnext.address` to an IPv4 literal.
     ///
     /// The provider excludes the addresses it resolved from the tunnel routes.
     /// Left dialling the hostname, Xray resolves again on every reconnect, and
@@ -79,13 +80,19 @@ public enum TunnelXrayConfigPreparer {
     /// the session in `connected`. TLS `serverName` and the WebSocket `host`
     /// header are set separately, so both keep carrying the hostname.
     ///
-    /// Load-bearing for the packet bridge too: it drops every IPv6 packet, so
-    /// the provider omits an IPv6 bypass route for the server on the strength
-    /// of this pinning. Dropping this call strands the transport.
+    /// IPv4 is required by VlessPacketTunnelProvider.applyNetworkSettings:
+    /// it installs no IPv6 excludedRoutes, and VlessPacketBridge drops IPv6
+    /// before hev sees it. Reverting pinning to a hostname or IPv6 literal
+    /// would capture and silently drop the VLESS transport itself. Keep these
+    /// routing and address-family invariants together when adding IPv6 egress.
     public static func pinningServerAddress(
         _ prepared: PreparedTunnelConfig,
         to literal: String
     ) throws -> PreparedTunnelConfig {
+        var address = in_addr()
+        guard inet_pton(AF_INET, literal, &address) == 1 else {
+            throw TunnelConfigError.ipv4ServerAddressRequired
+        }
         guard var root = try? JSONSerialization.jsonObject(with: prepared.config) as? [String: Any],
               var outbounds = root["outbounds"] as? [[String: Any]],
               let index = outbounds.firstIndex(where: { $0["tag"] as? String == "proxy" }),
