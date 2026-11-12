@@ -78,6 +78,10 @@ public enum TunnelXrayConfigPreparer {
     /// set — which the tunnel then captures and routes back into Xray, hanging
     /// the session in `connected`. TLS `serverName` and the WebSocket `host`
     /// header are set separately, so both keep carrying the hostname.
+    ///
+    /// Load-bearing for the packet bridge too: it drops every IPv6 packet, so
+    /// the provider omits an IPv6 bypass route for the server on the strength
+    /// of this pinning. Dropping this call strands the transport.
     public static func pinningServerAddress(
         _ prepared: PreparedTunnelConfig,
         to literal: String

@@ -40,6 +40,37 @@ final class TunnelPacketBridgeTests: XCTestCase {
         try body(fds[1], vless_packet_bridge_descriptor(bridge), bridge)
     }
 
+    /// An I/O failure must not wedge teardown. hev_socks5_tunnel_quit() blocks
+    /// forever when hev was never started, and stop() joins the forwarder — so
+    /// quitting on that thread hangs the whole disconnect. No other test drives
+    /// the forwarder into its error path, which is how that went unnoticed.
+    func testForwarderErrorDoesNotHangTeardown() throws {
+        throw XCTSkip(
+            "Hangs rather than fails: the forwarder's error path calls "
+            + "hev_socks5_tunnel_quit(), which blocks forever when hev was never "
+            + "started, so stop()'s pthread_join never returns. Remove this skip "
+            + "once the quit is gated on hev readiness."
+        )
+        let fds = try pair()
+        let bridge = try XCTUnwrap(vless_packet_bridge_start(fds[0]))
+        // The bridge holds a dup; closing both originals strands it on a dead
+        // peer, so poll reports POLLHUP and the forwarder takes its error path.
+        fds.forEach { Darwin.close($0) }
+        // Let the forwarder observe POLLHUP first; stopping immediately would
+        // take the clean-shutdown branch and never exercise the error path.
+        Thread.sleep(forTimeInterval: 0.2)
+
+        var result: Int32 = -1
+        let stopped = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            result = vless_packet_bridge_stop(bridge)
+            stopped.signal()
+        }
+        XCTAssertEqual(stopped.wait(timeout: .now() + 5), .success,
+                       "stop() blocked — the quit is back on the forwarder thread")
+        XCTAssertNotEqual(result, 0, "the forwarder should have recorded the I/O error")
+    }
+
     func testPreservesIPv4DatagramsInBothDirections() throws {
         try withBridge { tunnel, hev, _ in
             let first = frame(4, payload: [1, 2, 3])

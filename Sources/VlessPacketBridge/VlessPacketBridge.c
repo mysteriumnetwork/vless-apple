@@ -101,6 +101,10 @@ static bool read_packet(struct vless_packet_bridge *bridge, int fd, struct packe
     if (count < 0)
         return transient_error();
     if (count == 0) {
+        // EOF, not an empty datagram: a utun never emits one and neither does
+        // hev, so a zero-length read on either descriptor means the peer is
+        // gone. Reading it as an empty packet instead spins this loop, because
+        // the next poll reports the same readable EOF forever.
         errno = EIO;
         return false;
     }
@@ -168,9 +172,22 @@ static void *forward_packets(void *context)
     if (atomic_load(&bridge->stopping))
         return NULL;
     bridge->error = errno ? errno : EIO;
-    // An I/O failure must tear down hev too. Retry the wakeup until the owner
-    // stops us: the first failure can race hev initializing its quit event fd.
-    while (!atomic_load(&bridge->stopping)) {
+    // An I/O failure must tear down hev too. Retry the wakeup: the first
+    // failure can race hev initializing its quit event fd. Bounded at ~5s so a
+    // hev that honours quit late cannot pin this thread at 100 Hz forever.
+    //
+    // KNOWN GAP, needs a design decision rather than a patch here.
+    // hev_socks5_tunnel_quit() blocks forever when hev has not started
+    // (measured), so a forwarder that fails before hev initializes never
+    // returns from the first call: the thread leaks and stop()'s pthread_join
+    // hangs teardown. Two fixes were tried and are worse:
+    //   - closing hev's descriptor does not stop it (measured: alive >5s);
+    //   - quitting on a detached thread unblocks later and kills the NEXT
+    //     hev in the process, so a failed session breaks the next connect
+    //     (measured: it killed the real-hev test that ran after it).
+    // The workable shape is to gate this on hev readiness, which the Swift
+    // lifecycle already tracks, rather than guessing from inside the bridge.
+    for (int attempt = 0; attempt < 500 && !atomic_load(&bridge->stopping); ++attempt) {
         hev_socks5_tunnel_quit();
         struct pollfd wake = { .fd = bridge->wake[0], .events = POLLIN };
         poll(&wake, 1, 10);
@@ -189,6 +206,9 @@ struct vless_packet_bridge *vless_packet_bridge_start(int tunnel_fd)
     atomic_init(&bridge->stopping, false);
     atomic_init(&bridge->dropped_ipv6, 0);
     // Borrow the provider's utun for the session; never close its original fd.
+    // Note: dup() shares the file description, so the O_NONBLOCK that
+    // prepare_fd() sets below also applies to the caller's descriptor. Nothing
+    // else reads that fd here, and hev set the same flag on it before.
     bridge->tunnel = dup(tunnel_fd);
     if (bridge->tunnel < 0 || socketpair(AF_UNIX, SOCK_DGRAM, 0, bridge->sockets) < 0 ||
         pipe(bridge->wake) < 0)
