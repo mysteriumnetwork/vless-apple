@@ -48,6 +48,7 @@ let package = Package(
     .target(
       name: "vless_tunnel_support",
       dependencies: [
+        "VlessPacketBridge",
         "XRay",
         .product(name: "Tun2SocksKit", package: "Tun2SocksKit"),
         .product(name: "Tun2SocksKitC", package: "Tun2SocksKit")
@@ -55,9 +56,10 @@ let package = Package(
       // Go's net package resolves via libresolv (_res_9_ninit et al).
       linkerSettings: [.linkedLibrary("resolv")]
     ),
+    .target(name: "VlessPacketBridge"),
     .testTarget(
       name: "vless_tunnel_supportTests",
-      dependencies: ["vless_tunnel_support"]
+      dependencies: ["vless_tunnel_support", "VlessPacketBridge"]
     ),
     xrayCore
   ]

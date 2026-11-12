@@ -8,6 +8,7 @@
 import Foundation
 import NetworkExtension
 import Tun2SocksKit
+import VlessPacketBridge
 import XRay
 import os
 
@@ -72,7 +73,6 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
                prepared.serverAddress, prepared.socksPort)
 
         let addresses = resolveAll(prepared.serverAddress, family: AF_INET)
-        let addresses6 = resolveAll(prepared.serverAddress, family: AF_INET6)
         guard let resolved = addresses.first else {
             os_log("[TUNNEL] cannot resolve %@", log: log, type: .error, prepared.serverAddress)
             completionHandler(TunnelConfigError.unresolvableServer)
@@ -92,7 +92,7 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         applyNetworkSettings(
-            resolved: resolved, addresses: addresses, addresses6: addresses6
+            resolved: resolved, addresses: addresses
         ) { [weak self] error in
             guard let self else {
                 os_log("[TUNNEL] provider deallocated during setup", log: log, type: .error)
@@ -182,7 +182,14 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
                 _ = self.hev.markExited(code: 0)
                 return
             }
-            let code = Socks5Tunnel.run(withConfig: .string(content: hevConfig))
+            let code = hevConfig.withCString {
+                vless_ipv4_socks5_run_with_stop_check($0, hevConfig.utf8.count, { context in
+                    guard let context else { return 0 }
+                    let lifecycle = Unmanaged<TunnelWorkerLifecycle>.fromOpaque(context)
+                        .takeUnretainedValue()
+                    return lifecycle.isStopRequested ? 1 : 0
+                }, Unmanaged.passUnretained(self.hev).toOpaque())
+            }
             if self.hev.markExited(code: code) {
                 self.runtimeQueue.async { self.handleUnexpectedWorkerExit(code: code) }
             }
@@ -190,6 +197,12 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
 
         switch hev.waitForStableStartup(gracePeriod: hevStartupGrace) {
         case .running:
+            // hev being healthy does not mean the tunnel is: the forwarder can
+            // have died inside the grace period, which would report a started
+            // tunnel that carries nothing.
+            if vless_ipv4_socks5_forwarder_failed() != 0 {
+                throw TunnelRuntimeError.forwarderFailed
+            }
             return
         case let .exited(code):
             throw TunnelRuntimeError.workerExited(code: code)
@@ -220,10 +233,10 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         // so the next connect spawns a second one.
         _ = hev.requestStop()
 
-        // quit() is what makes the blocking Socks5Tunnel.run return; waiting
+        // quit() is what makes the blocking hev run return; waiting
         // first would just burn the whole timeout every disconnect.
         if !hev.waitForExit(timeout: 0) {
-            Socks5Tunnel.quit()
+            vless_ipv4_socks5_quit()
             _ = hev.waitForExit(timeout: hevShutdownTimeout)
         }
 
@@ -278,7 +291,6 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
     private func applyNetworkSettings(
         resolved: String,
         addresses: [String],
-        addresses6: [String],
         completion: @escaping (Error?) -> Void
     ) {
         os_log("[TUNNEL] applying settings; remote=%@", log: log, type: .info, resolved)
@@ -298,15 +310,14 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
         // Capture IPv6 as well. Leaving ipv6Settings nil does not disable the
         // device's physical IPv6 — it routes it outside the tunnel, which on a
         // dual-stack network leaks the user's real address for everything that
-        // prefers IPv6. Captured traffic is proxied, not dropped: dropping it
-        // reaches the client as "connected, then closed", which Chrome never
-        // retries over IPv4. Names resolve v4-only via the config's
-        // queryStrategy instead.
+        // prefers IPv6. The packet bridge discards IPv6 BEFORE hev's TCP stack
+        // can acknowledge a SYN. The browser sees an unfinished connection and
+        // can race IPv4 normally; an Xray blackhole acts after that handshake.
         let ipv6 = NEIPv6Settings(addresses: [tunnelAddressIPv6], networkPrefixLengths: [64])
         ipv6.includedRoutes = [NEIPv6Route.default()]
-        ipv6.excludedRoutes = addresses6.map {
-            NEIPv6Route(destinationAddress: $0, networkPrefixLength: 128)
-        }
+        // No IPv6 bypass: TunnelXrayConfigPreparer.pinningServerAddress above
+        // enforces an IPv4 literal. Keep that guard if changing resolution;
+        // a hostname/IPv6 transport would otherwise hit the IPv6 packet filter.
         settings.ipv6Settings = ipv6
 
         // Public resolvers, reached through the tunnel. Queries hit Xray's DNS

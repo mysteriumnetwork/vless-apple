@@ -10,6 +10,8 @@ public enum TunnelRuntimeError: Error, Equatable {
     case workerExited(code: Int32)
     /// The worker thread never reached its run loop.
     case workerNeverStarted
+    /// The packet bridge's forwarding thread died before the tunnel was up.
+    case forwarderFailed
 }
 
 /// Coordinates the tun2socks worker, which runs a blocking call on its own
