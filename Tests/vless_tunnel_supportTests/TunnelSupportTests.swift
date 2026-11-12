@@ -89,13 +89,41 @@ final class TunnelXrayConfigPreparerTests: XCTestCase {
         XCTAssertEqual(vnext["port"] as? Int, 443)
     }
 
-    func testPinningRejectsAddressesThatCannotUseTheIPv4TransportBypass() throws {
+    func testPinningRejectsAddressesThatCannotBeExcludedFromTheTunnel() throws {
         let base = try prepared()
-        for address in ["vpn.example.com", "2001:db8::1", "::ffff:203.0.113.7",
-                        "203.0.113.999", "203.0.113.7:443", ""] {
-            XCTAssertThrowsError(try TunnelXrayConfigPreparer.pinningServerAddress(base, to: address)) {
-                XCTAssertEqual($0 as? TunnelConfigError, .ipv4ServerAddressRequired)
+        // Hostnames re-resolve. The IPv4-in-IPv6 forms would be dialled as IPv4
+        // while the provider excluded them as IPv6, capturing the transport.
+        for address in ["vpn.example.com", "::ffff:203.0.113.7", "::203.0.113.7",
+                        "203.0.113.999", "203.0.113.7:443", "[2001:db8::1]:443", ""] {
+            XCTAssertThrowsError(
+                try TunnelXrayConfigPreparer.pinningServerAddress(base, to: address),
+                "\(address) must not be pinnable"
+            ) {
+                XCTAssertEqual($0 as? TunnelConfigError, .ipLiteralServerAddressRequired)
             }
+        }
+    }
+
+    /// A NAT64 underlay has no IPv4 at all, so the transport itself is IPv6.
+    /// `applyNetworkSettings` excludes it as an IPv6 route; without that pair
+    /// the tunnel captures its own transport and the bridge discards it.
+    func testPinningAcceptsAnIPv6LiteralForNAT64Underlays() throws {
+        let pinned = try TunnelXrayConfigPreparer.pinningServerAddress(
+            prepared(), to: "64:ff9b::cb00:7107"
+        )
+        let vnext = try firstVnext(in: pinned)
+        XCTAssertEqual(vnext["address"] as? String, "64:ff9b::cb00:7107")
+        XCTAssertEqual(vnext["port"] as? Int, 443)
+    }
+
+    /// The provider splits resolved addresses into per-family excluded routes
+    /// using exactly this predicate, so disagreement would strand one family.
+    func testIPv4LiteralsAreDistinguishedFromIPv6ForRouteExclusion() {
+        for address in ["203.0.113.7", "0.0.0.0", "255.255.255.255"] {
+            XCTAssertTrue(IPLiteral.isIPv4(address), address)
+        }
+        for address in ["64:ff9b::cb00:7107", "2001:db8::1", "::1", "vpn.example.com", ""] {
+            XCTAssertFalse(IPLiteral.isIPv4(address), address)
         }
     }
 
