@@ -202,7 +202,24 @@ final class TunnelPacketBridgeTests: XCTestCase {
 
     /// Exercise the actual pinned hev binary, not a mock TCP stack. An IPv6
     /// SYN must produce no response; an IPv4 SYN must still receive a SYN-ACK.
+    /// End that same session with an I/O failure and verify error propagation.
+    /// Keep these checks in one run: the pinned binary retains lwIP globals
+    /// across in-process initialization and cannot isolate two test sessions.
     func testRealHevAcknowledgesIPv4ButNeverIPv6() throws {
+        try withRealHev(expectedExit: -1000 - EIO) { tunnel, borrowed in
+            try send(tcpSYN(ipv6: true), to: tunnel)
+            XCTAssertNil(try receive(tunnel, timeout: 250), "IPv6 must not get a synthetic SYN-ACK")
+            try receiveIPv4Payload(tunnel)
+            // Shutdown affects the duplicate, producing POLLHUP in the bridge.
+            // No explicit quit: the bridge's single notification must stop hev.
+            XCTAssertEqual(shutdown(borrowed, SHUT_RDWR), 0)
+        }
+    }
+
+    private func withRealHev(
+        expectedExit: Int32 = 0,
+        _ body: (Int32, Int32) throws -> Void
+    ) throws {
         let fds = try pair()
         defer { fds.forEach { Darwin.close($0) } }
         let listener = socket(AF_INET, SOCK_STREAM, 0)
@@ -235,46 +252,130 @@ final class TunnelPacketBridgeTests: XCTestCase {
         misc:
           log-level: error
         """
+        let serverExited = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            defer { serverExited.signal() }
+            do { try self.serveSOCKSPayload(listener) }
+            catch { XCTFail("SOCKS payload server: \(error)") }
+        }
+        defer { XCTAssertEqual(serverExited.wait(timeout: .now() + 6), .success) }
         let exited = DispatchSemaphore(value: 0)
         DispatchQueue.global().async {
             let result = config.withCString {
                 vless_ipv4_socks5_run_on_descriptor($0, config.utf8.count, fds[0])
             }
-            XCTAssertEqual(result, 0)
+            XCTAssertEqual(result, expectedExit)
             exited.signal()
         }
         defer {
-            // quit may race hev's initialization; keep waking until it exits.
-            var stopped = false
-            for _ in 0..<100 {
+            if expectedExit == 0 {
                 vless_ipv4_socks5_quit()
-                if exited.wait(timeout: .now() + 0.02) == .success {
-                    stopped = true
-                    break
-                }
+            } else {
+                // Also release the worker if an assertion/unwrap above failed.
+                _ = shutdown(fds[0], SHUT_RDWR)
             }
-            XCTAssertTrue(stopped, "hev must exit and release its forwarding thread")
+            XCTAssertEqual(exited.wait(timeout: .now() + 2), .success,
+                           "hev must exit and release its forwarding thread")
         }
-        try send(tcpSYN(ipv6: true), to: fds[1])
-        XCTAssertNil(try receive(fds[1], timeout: 250), "IPv6 must not get a synthetic SYN-ACK")
-        try send(tcpSYN(ipv6: false), to: fds[1])
-        let reply = try XCTUnwrap(try receive(fds[1]))
-        guard reply.count >= 24 else {
-            XCTFail("Truncated IPv4 reply")
-            return
-        }
-        XCTAssertEqual(reply[4] >> 4, 4)
-        let tcp = 4 + Int(reply[4] & 0x0f) * 4
-        guard reply.count > tcp + 13 else {
-            XCTFail("Truncated TCP reply")
-            return
-        }
-        XCTAssertEqual(reply[tcp + 13] & 0x12, 0x12, "IPv4 still receives SYN+ACK")
+        try body(fds[1], fds[0])
     }
 
-    private func tcpSYN(ipv6: Bool) -> [UInt8] {
+    private static let bulkPayload = (0..<(512 * 1024)).map { UInt8($0 & 255) }
+
+    private func serveSOCKSPayload(_ listener: Int32) throws {
+        var event = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+        guard poll(&event, 1, 5000) > 0 else { throw POSIXError(.ETIMEDOUT) }
+        let peer = accept(listener, nil, nil)
+        guard peer >= 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+        defer { Darwin.close(peer) }
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        var enabled: Int32 = 1
+        XCTAssertEqual(setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                                 socklen_t(MemoryLayout<timeval>.size)), 0)
+        XCTAssertEqual(setsockopt(peer, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                                 socklen_t(MemoryLayout<timeval>.size)), 0)
+        XCTAssertEqual(setsockopt(peer, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                                 socklen_t(MemoryLayout<Int32>.size)), 0)
+        func readExactly(_ count: Int) throws -> [UInt8] {
+            var bytes = [UInt8](repeating: 0, count: count)
+            var offset = 0
+            while offset < count {
+                let readCount = bytes.withUnsafeMutableBytes {
+                    Darwin.read(peer, $0.baseAddress!.advanced(by: offset), count - offset)
+                }
+                guard readCount > 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+                offset += readCount
+            }
+            return bytes
+        }
+        func writeAll(_ bytes: [UInt8]) throws {
+            var offset = 0
+            while offset < bytes.count {
+                let count = bytes.withUnsafeBytes {
+                    Darwin.write(peer, $0.baseAddress!.advanced(by: offset), bytes.count - offset)
+                }
+                guard count > 0 else { throw POSIXError(.init(rawValue: errno) ?? .EIO) }
+                offset += count
+            }
+        }
+        XCTAssertEqual(try readExactly(3), [5, 1, 0])
+        try writeAll([5, 0])
+        let connect = try readExactly(10)
+        XCTAssertEqual(Array(connect.prefix(4)), [5, 1, 0, 1])
+        try writeAll([5, 0, 0, 1, 127, 0, 0, 1, 0, 80])
+        try writeAll(Self.bulkPayload)
+    }
+
+    /// A SYN-only check misses Unix datagram queue exhaustion. Transfer a real
+    /// 512 KiB SOCKS payload through hev/lwIP and ACK the synthetic TCP stream.
+    private func receiveIPv4Payload(_ tunnel: Int32) throws {
+        func uint32(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
+            bytes[offset..<(offset + 4)].reduce(0) { ($0 << 8) | UInt32($1) }
+        }
+        try send(tcpSYN(ipv6: false), to: tunnel)
+        let reply = try XCTUnwrap(try receive(tunnel))
+        guard reply.count >= 44 else { XCTFail("Truncated IPv4 SYN-ACK"); return }
+        XCTAssertEqual(reply[4] >> 4, 4)
+        let tcp = 4 + Int(reply[4] & 15) * 4
+        guard reply.count > tcp + 13 else { XCTFail("Truncated TCP reply"); return }
+        XCTAssertEqual(reply[tcp + 13] & 0x12, 0x12)
+        var expected = uint32(reply, tcp + 4) &+ 1
+        try send(tcpSYN(ipv6: false, sequence: 12346, acknowledgement: expected,
+                        flags: 0x10), to: tunnel)
+        var received: [UInt8] = []
+        var pending: [UInt32: [UInt8]] = [:]
+        let deadline = Date().addingTimeInterval(8)
+        while received.count < Self.bulkPayload.count && Date() < deadline {
+            guard let packet = try receive(tunnel, timeout: 100) else { continue }
+            guard packet.count >= 44, packet[4] >> 4 == 4 else { continue }
+            let offset = 4 + Int(packet[4] & 15) * 4
+            guard packet.count >= offset + 20 else { continue }
+            let dataOffset = offset + Int(packet[offset + 12] >> 4) * 4
+            guard dataOffset <= packet.count else { XCTFail("Invalid TCP header"); return }
+            let sequence = uint32(packet, offset + 4)
+            if dataOffset < packet.count {
+                if sequence >= expected { pending[sequence] = Array(packet[dataOffset...]) }
+                while let data = pending.removeValue(forKey: expected) {
+                    received += data
+                    expected &+= UInt32(data.count)
+                }
+                try send(tcpSYN(ipv6: false, sequence: 12346, acknowledgement: expected,
+                                flags: 0x10), to: tunnel)
+            }
+        }
+        XCTAssertEqual(received.count, Self.bulkPayload.count, "IPv4 transfer must not stall")
+        XCTAssertTrue(received == Self.bulkPayload, "IPv4 payload must remain intact")
+    }
+
+    private func tcpSYN(ipv6: Bool, sequence: UInt32 = 12345,
+                        acknowledgement: UInt32 = 0, flags: UInt8 = 0x02) -> [UInt8] {
         var tcp: [UInt8] = [0x9c, 0x40, 0x01, 0xbb, 0, 0, 0x30, 0x39,
                            0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]
+        for i in 0..<4 {
+            tcp[4 + i] = UInt8(truncatingIfNeeded: sequence >> (24 - i * 8))
+            tcp[8 + i] = UInt8(truncatingIfNeeded: acknowledgement >> (24 - i * 8))
+        }
+        tcp[13] = flags
         var ip: [UInt8]
         var pseudo: [UInt8]
         if ipv6 {

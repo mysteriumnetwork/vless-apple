@@ -228,6 +228,17 @@ struct vless_packet_bridge *vless_packet_bridge_start(int tunnel_fd)
     if (bridge->tunnel < 0 || socketpair(AF_UNIX, SOCK_DGRAM, 0, bridge->sockets) < 0 ||
         pipe(bridge->wake) < 0)
         goto fail;
+    // Darwin's Unix datagram defaults fit only two MTU-sized packets. Hev can
+    // emit a full TCP window without yielding; ENOBUFS on its write side can
+    // stall that flow. Reserve bounded queues for bursts in either direction.
+    // This also permits a full-size IP datagram, above the default 2 KiB limit.
+    const int socket_capacity = 256 * 1024;
+    for (size_t i = 0; i < 2; ++i)
+        if (setsockopt(bridge->sockets[i], SOL_SOCKET, SO_SNDBUF,
+                       &socket_capacity, sizeof(socket_capacity)) < 0 ||
+            setsockopt(bridge->sockets[i], SOL_SOCKET, SO_RCVBUF,
+                       &socket_capacity, sizeof(socket_capacity)) < 0)
+            goto fail;
     int fds[] = { bridge->tunnel, bridge->sockets[0], bridge->sockets[1],
                   bridge->wake[0], bridge->wake[1] };
     for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); ++i)
