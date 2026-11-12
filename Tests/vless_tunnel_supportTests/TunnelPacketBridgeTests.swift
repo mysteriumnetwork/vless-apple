@@ -116,6 +116,18 @@ final class TunnelPacketBridgeTests: XCTestCase {
         }
     }
 
+    func testZeroLengthDatagramsDoNotTearDownEitherDirection() throws {
+        try withBridge { tunnel, hev, _ in
+            let ipv4 = frame(4, payload: [1, 2, 3])
+            try send([], to: tunnel)
+            try send(ipv4, to: tunnel)
+            XCTAssertEqual(try receive(hev), ipv4)
+            try send([], to: hev)
+            try send(ipv4, to: hev)
+            XCTAssertEqual(try receive(tunnel), ipv4)
+        }
+    }
+
     func testStopWakesIdleForwarderAndKeepsTheBorrowedDescriptorOpen() throws {
         let fds = try pair()
         defer { fds.forEach { Darwin.close($0) } }

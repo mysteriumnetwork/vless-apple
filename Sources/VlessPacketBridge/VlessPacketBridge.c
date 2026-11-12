@@ -111,14 +111,8 @@ static bool read_packet(struct vless_packet_bridge *bridge, int fd, struct packe
     ssize_t count = read(fd, packet->bytes, sizeof(packet->bytes));
     if (count < 0)
         return transient_error();
-    if (count == 0) {
-        // EOF, not an empty datagram: a utun never emits one and neither does
-        // hev, so a zero-length read on either descriptor means the peer is
-        // gone. Reading it as an empty packet instead spins this loop, because
-        // the next poll reports the same readable EOF forever.
-        errno = EIO;
-        return false;
-    }
+    // A zero-length datagram is legal, not stream EOF. Treat it like any
+    // other malformed frame; poll handles descriptor errors and hangups.
     packet->length = (size_t)count;
     if (!accept_ipv4(bridge, packet))
         packet->length = 0;
@@ -227,9 +221,9 @@ struct vless_packet_bridge *vless_packet_bridge_start(int tunnel_fd)
     atomic_store(&forwarder_failed, false);
     atomic_init(&bridge->dropped_ipv6, 0);
     // Borrow the provider's utun for the session; never close its original fd.
-    // Note: dup() shares the file description, so the O_NONBLOCK that
-    // prepare_fd() sets below also applies to the caller's descriptor. Nothing
-    // else reads that fd here, and hev set the same flag on it before.
+    // dup shares file-status flags: prepare_fd sets O_NONBLOCK on the original
+    // utun too, just as hev did when reading it directly. FD_CLOEXEC applies
+    // only to our duplicate. Do not restore shared status flags during cleanup.
     bridge->tunnel = dup(tunnel_fd);
     if (bridge->tunnel < 0 || socketpair(AF_UNIX, SOCK_DGRAM, 0, bridge->sockets) < 0 ||
         pipe(bridge->wake) < 0)
