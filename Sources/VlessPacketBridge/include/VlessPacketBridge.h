@@ -20,6 +20,10 @@ int vless_ipv4_socks5_run(const char *config, size_t config_length);
 // Explicit fd entry point, also usable with packet-preserving socket pairs.
 // The caller retains ownership of tunnel_fd.
 int vless_ipv4_socks5_run_on_descriptor(const char *config, size_t config_length, int tunnel_fd);
+// Non-zero once the forwarding thread has died. hev can be healthy while
+// the bridge is not, which would report a started tunnel that carries
+// nothing, so startup must check this before declaring success.
+int vless_ipv4_socks5_forwarder_failed(void);
 void vless_ipv4_socks5_quit(void);
 
 #endif

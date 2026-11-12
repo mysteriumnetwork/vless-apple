@@ -36,6 +36,17 @@ _Static_assert(sizeof(struct vless_sockaddr_ctl) == 32, "Darwin sockaddr_ctl ABI
 extern int hev_socks5_tunnel_main_from_str(const unsigned char *, unsigned int, int);
 extern void hev_socks5_tunnel_quit(void);
 
+// hev_socks5_tunnel_quit() blocks forever until some hev exists, and then
+// quits whichever one does. Both are hazards: quitting before hev starts hangs
+// the caller, and a call left blocked kills the NEXT hev in the process. So
+// quit only while our own hev is known to be running. One tunnel per process,
+// hence one flag.
+static atomic_bool hev_ready;
+// Set when the forwarder dies. hev can be healthy while the bridge is not,
+// which would report a started tunnel that carries nothing, so startup
+// checks this. Session-scoped: cleared when a bridge starts.
+static atomic_bool forwarder_failed;
+
 // utun datagrams carry a four-byte, network-order address-family prefix.
 // One packet per direction bounds memory and applies backpressure rather than
 // building an unbounded queue in a memory-limited Network Extension.
@@ -172,6 +183,7 @@ static void *forward_packets(void *context)
     if (atomic_load(&bridge->stopping))
         return NULL;
     bridge->error = errno ? errno : EIO;
+    atomic_store(&forwarder_failed, true);
     // An I/O failure must tear down hev too. Retry the wakeup: the first
     // failure can race hev initializing its quit event fd. Bounded at ~5s so a
     // hev that honours quit late cannot pin this thread at 100 Hz forever.
@@ -187,8 +199,15 @@ static void *forward_packets(void *context)
     //     (measured: it killed the real-hev test that ran after it).
     // The workable shape is to gate this on hev readiness, which the Swift
     // lifecycle already tracks, rather than guessing from inside the bridge.
+    // Only once hev is up, and only while it is: quitting earlier never
+    // returns, and the retry window lets a hev that is still starting become
+    // ready. If it never does, give up rather than pin the thread — stop()
+    // joins it, and the Swift teardown quits hev when it is safe to.
     for (int attempt = 0; attempt < 500 && !atomic_load(&bridge->stopping); ++attempt) {
-        hev_socks5_tunnel_quit();
+        if (atomic_load(&hev_ready)) {
+            hev_socks5_tunnel_quit();
+            break;
+        }
         struct pollfd wake = { .fd = bridge->wake[0], .events = POLLIN };
         poll(&wake, 1, 10);
     }
@@ -204,6 +223,8 @@ struct vless_packet_bridge *vless_packet_bridge_start(int tunnel_fd)
     bridge->sockets[0] = bridge->sockets[1] = -1;
     bridge->wake[0] = bridge->wake[1] = -1;
     atomic_init(&bridge->stopping, false);
+    atomic_store(&hev_ready, false);
+    atomic_store(&forwarder_failed, false);
     atomic_init(&bridge->dropped_ipv6, 0);
     // Borrow the provider's utun for the session; never close its original fd.
     // Note: dup() shares the file description, so the O_NONBLOCK that
@@ -290,14 +311,28 @@ int vless_ipv4_socks5_run_on_descriptor(const char *config, size_t config_length
     struct vless_packet_bridge *bridge = vless_packet_bridge_start(tunnel_fd);
     if (!bridge)
         return -1000 - errno;
+    // Ready from here: hev main is being entered, so a quit can only block for
+    // as long as its initialization takes, never forever. Set before the call
+    // because it does not return until hev stops.
+    atomic_store(&hev_ready, true);
     int result = hev_socks5_tunnel_main_from_str((const unsigned char *)config,
                                                (unsigned int)config_length,
                                                vless_packet_bridge_descriptor(bridge));
+    // hev has returned; a later quit would land on whatever starts next.
+    atomic_store(&hev_ready, false);
     int error = vless_packet_bridge_stop(bridge);
     return error ? -1000 - error : result;
 }
 
+int vless_ipv4_socks5_forwarder_failed(void)
+{
+    return atomic_load(&forwarder_failed) ? 1 : 0;
+}
+
 void vless_ipv4_socks5_quit(void)
 {
-    hev_socks5_tunnel_quit();
+    // Same rule as the bridge's error path: before hev is up this never
+    // returns, and teardown would hang behind it.
+    if (atomic_load(&hev_ready))
+        hev_socks5_tunnel_quit();
 }

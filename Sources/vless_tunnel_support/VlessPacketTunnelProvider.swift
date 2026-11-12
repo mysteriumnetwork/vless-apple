@@ -192,6 +192,12 @@ open class VlessPacketTunnelProvider: NEPacketTunnelProvider {
 
         switch hev.waitForStableStartup(gracePeriod: hevStartupGrace) {
         case .running:
+            // hev being healthy does not mean the tunnel is: the forwarder can
+            // have died inside the grace period, which would report a started
+            // tunnel that carries nothing.
+            if vless_ipv4_socks5_forwarder_failed() != 0 {
+                throw TunnelRuntimeError.forwarderFailed
+            }
             return
         case let .exited(code):
             throw TunnelRuntimeError.workerExited(code: code)

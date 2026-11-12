@@ -45,12 +45,6 @@ final class TunnelPacketBridgeTests: XCTestCase {
     /// quitting on that thread hangs the whole disconnect. No other test drives
     /// the forwarder into its error path, which is how that went unnoticed.
     func testForwarderErrorDoesNotHangTeardown() throws {
-        throw XCTSkip(
-            "Hangs rather than fails: the forwarder's error path calls "
-            + "hev_socks5_tunnel_quit(), which blocks forever when hev was never "
-            + "started, so stop()'s pthread_join never returns. Remove this skip "
-            + "once the quit is gated on hev readiness."
-        )
         let fds = try pair()
         let bridge = try XCTUnwrap(vless_packet_bridge_start(fds[0]))
         // The bridge holds a dup; closing both originals strands it on a dead
